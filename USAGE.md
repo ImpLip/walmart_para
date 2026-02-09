@@ -6,6 +6,7 @@ How to set up and use the Walmart Ads Report Snapshot Fetcher.
 
 - Python 3.8+
 - A Walmart Advertising API account with valid credentials
+- Your RSA private key file (`.pem`) provided during Walmart onboarding
 
 ## Setup
 
@@ -23,7 +24,17 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure credentials
+### 3. Place your private key
+
+Copy your RSA private key file (provided by Walmart during onboarding) into the project directory:
+
+```bash
+cp /path/to/your/private_key.pem ./private_key.pem
+```
+
+Make sure the file is not committed to git (it is excluded via `.gitignore`).
+
+### 4. Configure credentials
 
 Copy the example env file and fill in your credentials:
 
@@ -34,20 +45,39 @@ cp .env.example .env
 Edit `.env` with your values:
 
 ```env
-WALMART_ACCESS_TOKEN=your_bearer_token_here
-WALMART_CONSUMER_ID=your_consumer_id_here
-WALMART_AUTH_SIGNATURE=your_auth_signature_here
+WALMART_CLIENT_ID=your_client_id_here
+WALMART_CLIENT_SECRET=your_client_secret_here
+WALMART_PRIVATE_KEY_PATH=private_key.pem
 WALMART_KEY_VERSION=1
 WALMART_ADVERTISER_ID=your_default_advertiser_id
 ```
 
-| Variable                  | Required | Description                                |
-|---------------------------|----------|--------------------------------------------|
-| `WALMART_ACCESS_TOKEN`    | Yes      | Bearer token for API authorization         |
-| `WALMART_CONSUMER_ID`     | Yes      | Your Walmart consumer ID                   |
-| `WALMART_AUTH_SIGNATURE`  | Yes      | Authentication signature                   |
-| `WALMART_KEY_VERSION`     | No       | Signature key version (defaults to `1`)    |
-| `WALMART_ADVERTISER_ID`   | No       | Default advertiser ID (overridable via CLI)|
+| Variable                   | Required | Description                                          |
+|----------------------------|----------|------------------------------------------------------|
+| `WALMART_CLIENT_ID`        | Yes      | Client ID (also used as `WM_CONSUMER.ID` header)    |
+| `WALMART_CLIENT_SECRET`    | Yes      | Client secret (used for OAuth token request)         |
+| `WALMART_PRIVATE_KEY_PATH` | No       | Path to RSA private key `.pem` (default: `private_key.pem`) |
+| `WALMART_KEY_VERSION`      | No       | Signature key version (defaults to `1`)              |
+| `WALMART_ADVERTISER_ID`    | No       | Default advertiser ID (overridable via CLI)          |
+
+### Where to get these credentials
+
+All credentials are provided by Walmart during advertiser/partner onboarding:
+
+- **Client ID** and **Client Secret** -- from the Walmart Developer Portal
+- **Private Key (.pem)** -- RSA key used to sign API requests
+- **Key Version** -- usually `1` (provided with the key)
+- **Advertiser ID** -- your Walmart advertiser account ID
+
+## How Authentication Works
+
+The tool handles authentication automatically. On each run:
+
+1. **OAuth token** is fetched from Walmart's token endpoint using your client ID and secret. The token is cached for ~1 hour.
+2. **RSA signature** is generated per-request using your private key, the current timestamp, HTTP method, and request path.
+3. **Headers** are assembled with the token, signature, timestamp, and consumer ID.
+
+You do not need to manually generate tokens or signatures.
 
 ## Running Reports
 
@@ -135,6 +165,8 @@ The tool logs each step with timestamps and prints a summary on completion:
 
 ```
 2026-02-09 14:30:00 [INFO] === Step 1/3: Creating snapshot job ===
+2026-02-09 14:30:00 [INFO] Requesting new OAuth access token...
+2026-02-09 14:30:01 [INFO] OAuth token obtained, expires in 3600s
 2026-02-09 14:30:01 [INFO] Creating snapshot: type=campaign, range=2026-01-01 to 2026-01-15
 2026-02-09 14:30:02 [INFO] Snapshot created: snapshotId=abc123
 2026-02-09 14:30:02 [INFO] === Step 2/3: Polling for job completion ===
@@ -175,7 +207,10 @@ The Walmart API enforces these date rules:
 
 | Error Message                                    | Cause                                    | Solution                                          |
 |-------------------------------------------------|------------------------------------------|--------------------------------------------------|
-| `WALMART_ACCESS_TOKEN is not set in .env`       | Missing credential                       | Fill in all required values in `.env`             |
+| `WALMART_CLIENT_ID is not set in .env`          | Missing client ID                        | Fill in `WALMART_CLIENT_ID` in `.env`             |
+| `WALMART_CLIENT_SECRET is not set in .env`      | Missing client secret                    | Fill in `WALMART_CLIENT_SECRET` in `.env`         |
+| `WALMART_PRIVATE_KEY_PATH is not set in .env`   | Missing key path                         | Set path to your `.pem` file in `.env`            |
+| `No such file: private_key.pem`                 | Private key file not found               | Place your `.pem` file at the configured path     |
 | `No advertiser ID provided`                     | No ID via CLI or `.env`                  | Use `--advertiser-id` or set `WALMART_ADVERTISER_ID` in `.env` |
 | `Invalid date format`                           | Date not in `YYYY-MM-DD` format          | Use correct format, e.g., `2026-01-15`           |
 | `Date range exceeds the N-day limit`            | Range too wide for report type           | Narrow the date range                            |
@@ -184,7 +219,7 @@ The Walmart API enforces these date rules:
 | `Snapshot job failed`                           | Server-side job failure                  | Retry; check report type and date range          |
 | `Snapshot job expired`                          | Job result expired (24h window)          | Create a new snapshot and download promptly       |
 | `Snapshot did not complete after 60 attempts`   | Job took longer than ~30 minutes         | Retry later; the API may be under heavy load      |
-| `API error: 401`                                | Invalid or expired credentials           | Refresh your access token                        |
+| `API error: 401`                                | Invalid/expired token or bad signature   | Check client ID, secret, and private key          |
 | `API error: 429`                                | Rate limited                             | Wait and retry                                   |
 
 ### Interrupt
@@ -197,11 +232,13 @@ Press `Ctrl+C` at any time to cancel the operation. The tool exits cleanly with 
 walmart_para/
 ├── .env.example          # Template for required env vars
 ├── .env                  # Your credentials (git-ignored)
+├── .gitignore            # Excludes venv, .env, pycache, pem files
 ├── requirements.txt      # Python dependencies
 ├── config.py             # Configuration & constants
-├── auth.py               # Authentication header builder
+├── auth.py               # OAuth token + RSA signature + header assembly
 ├── snapshot_client.py    # Core API client (create, poll, download)
 ├── report_fetcher.py     # CLI entry point
+├── private_key.pem       # Your RSA private key (git-ignored)
 ├── reports/              # Output directory for downloaded CSVs
 ├── venv/                 # Python virtual environment
 ├── IMPLEMENTATION.md     # Technical implementation details

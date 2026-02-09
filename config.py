@@ -4,13 +4,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Walmart API credentials
-WALMART_ACCESS_TOKEN = os.getenv("WALMART_ACCESS_TOKEN", "")
-WALMART_CONSUMER_ID = os.getenv("WALMART_CONSUMER_ID", "")
-WALMART_AUTH_SIGNATURE = os.getenv("WALMART_AUTH_SIGNATURE", "")
+WALMART_CLIENT_ID = os.getenv("WALMART_CLIENT_ID", "")
+WALMART_CLIENT_SECRET = os.getenv("WALMART_CLIENT_SECRET", "")
+WALMART_PRIVATE_KEY_PATH = os.getenv("WALMART_PRIVATE_KEY_PATH", "private_key.pem")
 WALMART_KEY_VERSION = os.getenv("WALMART_KEY_VERSION", "1")
 WALMART_ADVERTISER_ID = os.getenv("WALMART_ADVERTISER_ID", "")
 
 # API endpoints
+TOKEN_URL = "https://api-gateway.walmart.com/v3/token"
 BASE_URL = "https://developer.api.us.walmart.com/api-proxy/service/display/api/v1/api/v1"
 DOWNLOAD_URL = "https://advertising.walmart.com/display/file"
 

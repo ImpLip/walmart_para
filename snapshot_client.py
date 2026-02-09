@@ -68,7 +68,7 @@ def create_snapshot(advertiser_id, report_type, start_date, end_date):
     }
 
     logger.info("Creating snapshot: type=%s, range=%s to %s", report_type, start_date, end_date)
-    headers = get_auth_headers()
+    headers = get_auth_headers("POST", url)
     resp = requests.post(url, json=payload, headers=headers, timeout=30)
     resp.raise_for_status()
 
@@ -94,7 +94,7 @@ def poll_snapshot(advertiser_id, snapshot_id):
     }
 
     for attempt in range(1, MAX_POLL_ATTEMPTS + 1):
-        headers = get_auth_headers()
+        headers = get_auth_headers("GET", url)
         resp = requests.get(url, params=params, headers=headers, timeout=30)
         resp.raise_for_status()
 
@@ -150,7 +150,7 @@ def download_report(file_url, advertiser_id, output_path):
     params = {"advertiserId": advertiser_id}
 
     logger.info("Downloading report from: %s", download_url)
-    headers = get_auth_headers()
+    headers = get_auth_headers("GET", download_url)
     # Remove Content-Type for download request
     headers.pop("Content-Type", None)
 

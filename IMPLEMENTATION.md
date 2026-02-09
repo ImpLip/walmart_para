@@ -11,7 +11,7 @@ report_fetcher.py   (CLI orchestrator)
        |
 snapshot_client.py  (API client - create, poll, download)
        |
-   auth.py          (authentication header builder)
+   auth.py          (OAuth token + RSA signature + header assembly)
        |
   config.py         (environment variables & constants)
 ```
@@ -22,18 +22,19 @@ snapshot_client.py  (API client - create, poll, download)
 
 Loads credentials from a `.env` file using `python-dotenv` and exposes them as module-level constants.
 
-| Constant               | Purpose                                     | Default |
-|------------------------|---------------------------------------------|---------|
-| `WALMART_ACCESS_TOKEN` | Bearer token for API authorization           | `""`    |
-| `WALMART_CONSUMER_ID`  | Consumer identity header                     | `""`    |
-| `WALMART_AUTH_SIGNATURE`| Cryptographic signature for request signing | `""`    |
-| `WALMART_KEY_VERSION`  | Signature key version                        | `"1"`   |
-| `WALMART_ADVERTISER_ID`| Default advertiser (overridable via CLI)     | `""`    |
+| Constant                | Purpose                                      | Default            |
+|-------------------------|----------------------------------------------|--------------------|
+| `WALMART_CLIENT_ID`     | Consumer ID (used in headers and signing)    | `""`               |
+| `WALMART_CLIENT_SECRET` | Client secret (used for OAuth token request) | `""`               |
+| `WALMART_PRIVATE_KEY_PATH` | Path to RSA private key `.pem` file       | `"private_key.pem"`|
+| `WALMART_KEY_VERSION`   | Signature key version                        | `"1"`              |
+| `WALMART_ADVERTISER_ID` | Default advertiser (overridable via CLI)     | `""`               |
 
 **API Endpoints:**
 
 | Constant       | URL                                                                                     |
 |---------------|-----------------------------------------------------------------------------------------|
+| `TOKEN_URL`   | `https://api-gateway.walmart.com/v3/token`                                              |
 | `BASE_URL`    | `https://developer.api.us.walmart.com/api-proxy/service/display/api/v1/api/v1`          |
 | `DOWNLOAD_URL`| `https://advertising.walmart.com/display/file`                                          |
 
@@ -51,29 +52,90 @@ Loads credentials from a `.env` file using `python-dotenv` and exposes them as m
 
 ### `auth.py`
 
-**Function:** `get_auth_headers() -> dict`
+Handles the full Walmart authentication flow: OAuth token management, per-request RSA signature generation, and header assembly.
 
-Builds the 6 required HTTP headers for every Walmart API call:
+#### Authentication Flow
 
+Every API request requires:
+1. A valid **OAuth access token** (fetched dynamically, cached ~1 hour)
+2. A **per-request RSA SHA256 signature** (generated from private key)
+3. A **current timestamp** in epoch milliseconds
+
+```
+[Validate credentials]
+        |
+[Fetch OAuth token]  ←── cached until ~60s before expiry
+        |
+[Generate timestamp]
+        |
+[Build sign string]  →  ClientID\nTimestamp\nMETHOD\nPATH\n
+        |
+[RSA SHA256 sign]    →  sign with private key (.pem)
+        |
+[Base64 encode]      →  WM_SEC.AUTH_SIGNATURE
+        |
+[Assemble headers]
+```
+
+#### `_validate_credentials()`
+
+Checks that `WALMART_CLIENT_ID`, `WALMART_CLIENT_SECRET`, and `WALMART_PRIVATE_KEY_PATH` are set. Raises `ValueError` if any are missing.
+
+#### `_get_access_token() -> str`
+
+Fetches an OAuth access token via the Walmart token endpoint.
+
+- **Endpoint:** `POST https://api-gateway.walmart.com/v3/token`
+- **Auth:** HTTP Basic (`base64(clientId:clientSecret)`)
+- **Body:** `grant_type=client_credentials`
+- **Response:** `{ "access_token": "...", "expires_in": 3600 }`
+- **Caching:** Token is cached in a module-level `_token_cache` dict. A new token is only fetched when the cached one is within 60 seconds of expiry.
+
+#### `_load_private_key()`
+
+Reads and parses the RSA private key from the PEM file specified by `WALMART_PRIVATE_KEY_PATH`. Uses `cryptography.hazmat.primitives.serialization.load_pem_private_key()`.
+
+#### `_generate_signature(method, url, timestamp) -> str`
+
+Generates the per-request RSA SHA256 signature.
+
+1. Extracts the **request path** from the full URL (e.g., `/api/v1/snapshot/report`)
+2. Builds the **string to sign** in the exact format required by Walmart:
+   ```
+   {ConsumerID}\n{Timestamp}\n{HTTP_METHOD}\n{REQUEST_PATH}\n
+   ```
+3. Signs with **RSA PKCS1v15 + SHA256** using the private key
+4. **Base64 encodes** the result
+
+The signature must be regenerated for every request because it includes the timestamp and request path.
+
+#### `get_auth_headers(method, url) -> dict`
+
+Main entry point. Assembles all 6 required headers for a Walmart API request.
+
+**Parameters:**
+- `method` — HTTP method (`"GET"`, `"POST"`, etc.)
+- `url` — Full request URL (path is extracted for signing)
+
+**Returns:**
 ```python
 {
-    "Authorization": "Bearer <TOKEN>",
-    "WM_CONSUMER.ID": "<CONSUMER_ID>",
-    "WM_SEC.AUTH_SIGNATURE": "<SIGNATURE>",
+    "Authorization": "Bearer <access_token>",
+    "WM_CONSUMER.ID": "<client_id>",
+    "WM_SEC.AUTH_SIGNATURE": "<rsa_signature>",
     "WM_CONSUMER.intimestamp": "<epoch_milliseconds>",
-    "WM_SEC.KEY_VERSION": "<VERSION>",
+    "WM_SEC.KEY_VERSION": "<version>",
     "Content-Type": "application/json",
 }
 ```
 
-- The `intimestamp` is generated fresh on each call using `time.time() * 1000` (epoch milliseconds).
-- Raises `ValueError` if any of the three critical credentials (`TOKEN`, `CONSUMER_ID`, `AUTH_SIGNATURE`) are missing.
+The timestamp used in the header matches the one used in the signature — both are generated in the same call.
 
 ---
 
 ### `snapshot_client.py`
 
-The core API client. Contains three public functions and one private validator.
+The core API client. Contains three public functions and one private validator. Each function passes the HTTP method and URL to `get_auth_headers()` so that signatures are generated correctly per-request.
 
 #### `_validate_dates(report_type, start_date, end_date)`
 
@@ -103,7 +165,7 @@ Creates a snapshot report job.
 - **Flow:**
   1. Validates `report_type` against the 7 allowed types.
   2. Validates date constraints via `_validate_dates()`.
-  3. Sends POST request with JSON payload and auth headers.
+  3. Sends POST request with JSON payload and auth headers (signed for `POST` + request path).
   4. Extracts and returns `snapshotId` from the response.
 - **Errors:** Raises `ValueError` for invalid inputs, `RuntimeError` if no `snapshotId` is returned, and `requests.HTTPError` on API failures.
 
@@ -114,7 +176,7 @@ Polls the snapshot status until it reaches a terminal state.
 - **Endpoint:** `GET {BASE_URL}/snapshot?advertiserId={id}&snapshotId={id}`
 - **Flow:**
   1. Loops up to `MAX_POLL_ATTEMPTS` (60) times.
-  2. On each iteration, sends a GET request with fresh auth headers.
+  2. On each iteration, sends a GET request with fresh auth headers (new signature + timestamp each poll).
   3. Checks `jobStatus` in the response:
      - `done` -- Returns the full response dict (contains `details` URL).
      - `failed` -- Raises `RuntimeError`.
@@ -132,7 +194,7 @@ Downloads, decompresses, and saves the report as a CSV file.
 - **Flow:**
   1. Parses the `file_url` (from the poll response `details` field) to extract the file ID (last path segment).
   2. Constructs the download URL using the `DOWNLOAD_URL` base.
-  3. Sends a streaming GET request (with `Content-Type` header removed).
+  3. Sends a streaming GET request signed for the download path (with `Content-Type` header removed).
   4. Writes the raw gzip response to a temporary `.gz` file.
   5. Decompresses the `.gz` file to the final CSV path using `gzip.open()`.
   6. Deletes the temporary `.gz` file.
@@ -223,27 +285,80 @@ DOWNLOAD COMPLETE
 ```
 Client                          Walmart API
   |                                  |
-  |--- POST /snapshot/report ------->|  (create job)
-  |<-------- { snapshotId } ---------|
+  |--- POST /v3/token ------------->|  (OAuth: get access token)
+  |<-------- { access_token } ------|
   |                                  |
-  |--- GET /snapshot?snapshotId= --->|  (poll status)
-  |<-------- { status: pending } ----|
-  |          ... sleep 30s ...       |
-  |--- GET /snapshot?snapshotId= --->|  (poll again)
-  |<-------- { status: done,     ----|
-  |            details: <url> }      |
+  |  [generate timestamp]           |
+  |  [build sign string]            |
+  |  [RSA SHA256 sign + base64]     |
   |                                  |
-  |--- GET /display/file/{id} ------>|  (download)
-  |<-------- <gzip binary> ---------|
+  |--- POST /snapshot/report ------>|  (create job, signed)
+  |<-------- { snapshotId } --------|
+  |                                  |
+  |  [re-sign for GET]              |
+  |--- GET /snapshot?snapshotId= -->|  (poll status, signed)
+  |<-------- { status: pending } ---|
+  |          ... sleep 30s ...      |
+  |  [re-sign for GET]              |
+  |--- GET /snapshot?snapshotId= -->|  (poll again, signed)
+  |<-------- { status: done,     ---|
+  |            details: <url> }     |
+  |                                  |
+  |  [re-sign for GET]              |
+  |--- GET /display/file/{id} ----->|  (download, signed)
+  |<-------- <gzip binary> --------|
   |                                  |
   [decompress gzip -> save CSV]
 ```
 
+## Authentication Deep Dive
+
+### OAuth Token (Step 1)
+
+```
+POST https://api-gateway.walmart.com/v3/token
+Authorization: Basic base64(clientId:clientSecret)
+Content-Type: application/x-www-form-urlencoded
+Body: grant_type=client_credentials
+
+Response: { "access_token": "xxx", "expires_in": 3600 }
+```
+
+The token is cached in memory and reused until 60 seconds before expiry.
+
+### RSA Signature (Per Request)
+
+For every API call, a unique signature is generated:
+
+1. **Build the sign string** (newlines are required):
+   ```
+   {CLIENT_ID}
+   {TIMESTAMP_MS}
+   {HTTP_METHOD}
+   {REQUEST_PATH}
+
+   ```
+
+2. **Sign** with RSA PKCS1v15 + SHA256 using the private key (`.pem`)
+
+3. **Base64 encode** the raw signature bytes
+
+The timestamp in the signature must exactly match the `WM_CONSUMER.intimestamp` header.
+
+### Common Auth Failures
+
+| Symptom               | Cause                                          |
+|-----------------------|------------------------------------------------|
+| 401 Unauthorized       | Expired token, wrong key, or signature mismatch|
+| Invalid Signature      | Wrong path in sign string, bad newline format  |
+| Token request fails    | Wrong client ID or secret                      |
+
 ## Dependencies
 
-| Package        | Purpose                        |
-|----------------|--------------------------------|
-| `requests`     | HTTP client for API calls      |
-| `python-dotenv`| Load `.env` file credentials   |
+| Package        | Purpose                                    |
+|----------------|--------------------------------------------|
+| `requests`     | HTTP client for API calls                  |
+| `python-dotenv`| Load `.env` file credentials               |
+| `cryptography` | RSA SHA256 signing with private key (.pem) |
 
-Standard library modules used: `argparse`, `csv`, `gzip`, `logging`, `os`, `sys`, `time`, `datetime`, `urllib.parse`.
+Standard library modules used: `argparse`, `base64`, `csv`, `gzip`, `logging`, `os`, `sys`, `time`, `datetime`, `urllib.parse`.
